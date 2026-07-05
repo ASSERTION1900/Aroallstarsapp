@@ -40,13 +40,24 @@ async function writeDoc(key, value) {
 function listenDoc(key, cb) {
   if (!sb) return () => {};
   let alive = true;
-  sb.from('app_data').select('value').eq('key', key).maybeSingle()
-    .then(({ data }) => { if (alive) cb(data && data.value !== undefined ? data.value : null); }).catch(() => { if (alive) cb(null); });
+
+  // Fetch current value immediately
+  const fetchNow = () => sb.from('app_data').select('value').eq('key', key).maybeSingle()
+    .then(({ data }) => { if (alive) cb(data && data.value !== undefined ? data.value : null); })
+    .catch(() => {});
+
+  fetchNow();
+
+  // Realtime subscription — fires instantly when any device saves
   const ch = sb.channel('rt_' + key)
     .on('postgres_changes', { event: '*', schema: 'public', table: 'app_data', filter: `key=eq.${key}` }, p => {
       if (alive) cb(p.eventType === 'DELETE' ? null : p.new.value);
     }).subscribe();
-  return () => { alive = false; try { sb.removeChannel(ch); } catch(e) {} };
+
+  // Polling fallback every 15 seconds — guarantees sync even if realtime drops
+  const poll = setInterval(fetchNow, 15000);
+
+  return () => { alive = false; clearInterval(poll); try { sb.removeChannel(ch); } catch(e) {} };
 }
 
 // ── PHOTO UPLOAD ────────────────────────────────────────────────────────────
@@ -546,7 +557,7 @@ function DuesPage({ members, dues, setDues, role, settings }) {
   const mk = `${year}-${String(month+1).padStart(2,'0')}`;
   const active = members.filter(m=>m.status==='active');
   const paid = active.filter(m=>dues[m.id] && dues[m.id][mk] && dues[m.id][mk].paid);
-  const unpaid = active.filter(m=>!dues[m.id] && dues[m.id][mk] && dues[m.id][mk].paid);
+  const unpaid = active.filter(m=>!(dues[m.id] && dues[m.id][mk] && dues[m.id][mk].paid));
   const list = tab==='paid'?paid:tab==='unpaid'?unpaid:active;
 
   const toggle = id => {
@@ -719,7 +730,7 @@ function MeetingsPage({ meetings, setMeetings, members, role, settings }) {
   if (vm) {
     const present = active.filter(m=>vm.attendance && vm.attendance[m.id]);
     const late = active.filter(m=>vm.late && vm.late[m.id]);
-    const absent = active.filter(m=>!vm.attendance && vm.attendance[m.id]);
+    const absent = active.filter(m=>!(vm.attendance && vm.attendance[m.id]));
     return (
       <div>
         <div style={{ background:`linear-gradient(135deg,${C.blue},#1e40af)`, padding:'16px 18px', borderBottom:`3px solid ${C.goldBorder}`, display:'flex', alignItems:'center', gap:12 }}>
