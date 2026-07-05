@@ -1,0 +1,1031 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>ARO AllStars Aba FC</title>
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.39.3/dist/umd/supabase.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#f0f4f8;font-family:'Inter',sans-serif;color:#111827;-webkit-font-smoothing:antialiased}
+::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:#94a3b8;border-radius:4px}
+input,select,textarea,button{font-family:inherit;outline:none;-webkit-appearance:none}
+</style>
+<script>
+// ── SUPABASE BOOTSTRAP ──────────────────────────────────────────────────────
+const SB_KEY = 'aro_sb_v1';
+let sb = null, sbReady = false;
+
+function loadCfg() {
+  try { const r = localStorage.getItem(SB_KEY); return r ? JSON.parse(r) : null; } catch(e) { return null; }
+}
+function initSb(cfg) {
+  try {
+    sb = supabase.createClient(cfg.url, cfg.anonKey, { auth: { persistSession: false } });
+    sbReady = true; return true;
+  } catch(e) { sbReady = false; return false; }
+}
+const _saved = loadCfg();
+if (_saved) initSb(_saved);
+
+// ── DATA HELPERS ────────────────────────────────────────────────────────────
+async function writeDoc(key, value) {
+  if (!sb) return;
+  try { await sb.from('app_data').upsert({ key, value, updated_at: new Date().toISOString() }, { onConflict: 'key' }); } catch(e) {}
+}
+function listenDoc(key, cb) {
+  if (!sb) return () => {};
+  let alive = true;
+  sb.from('app_data').select('value').eq('key', key).maybeSingle()
+    .then(({ data }) => { if (alive) cb(data && data.value !== undefined ? data.value : null); }).catch(() => { if (alive) cb(null); });
+  const ch = sb.channel('rt_' + key)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'app_data', filter: `key=eq.${key}` }, p => {
+      if (alive) cb(p.eventType === 'DELETE' ? null : p.new.value);
+    }).subscribe();
+  return () => { alive = false; try { sb.removeChannel(ch); } catch(e) {} };
+}
+
+// ── PHOTO UPLOAD ────────────────────────────────────────────────────────────
+async function uploadPhoto(file, prefix) {
+  if (!sb) throw new Error('Not connected to Supabase');
+  const blob = await new Promise((res, rej) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const max = 600; let w = img.width, h = img.height;
+        if (w > max || h > max) { if (w > h) { h = Math.round(h*max/w); w=max; } else { w=Math.round(w*max/h); h=max; } }
+        const c = document.createElement('canvas'); c.width=w; c.height=h;
+        c.getContext('2d').drawImage(img,0,0,w,h);
+        c.toBlob(b => b ? res(b) : rej(new Error('Resize failed')), 'image/jpeg', 0.85);
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+  const path = `${prefix}/${Date.now()}.jpg`;
+  const { error } = await sb.storage.from('club-photos').upload(path, blob, { contentType: 'image/jpeg', upsert: true });
+  if (error) throw error;
+  return sb.storage.from('club-photos').getPublicUrl(path).data.publicUrl;
+}
+</script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="env,react" data-plugins="transform-optional-chaining,transform-nullish-coalescing-operator">
+const { useState, useEffect, useRef } = React;
+
+// ── COLOURS ─────────────────────────────────────────────────────────────────
+const C = {
+  bg:'#f0f4f8', card:'#ffffff', border:'#e2e8f0',
+  blue:'#1e3a8a', blueMid:'#2563eb', blueLight:'#dbeafe',
+  gold:'#b45309', goldLight:'#fef3c7', goldBorder:'#f59e0b',
+  green:'#15803d', greenLight:'#dcfce7',
+  red:'#b91c1c', redLight:'#fee2e2',
+  text:'#111827', muted:'#6b7280', white:'#ffffff',
+};
+
+// ── APP CONSTANTS ────────────────────────────────────────────────────────────
+const DEFAULT_PWS = {
+  chairman:'aro2012chairman', vice_chairman:'aro2012vicechair',
+  financial_secretary:'aro2012finsec', secretary:'aro2012secretary',
+  pro:'aro2012pro', captain:'aro2012captain', treasurer:'aro2012treasurer',
+};
+const ROLES_LIST = [
+  { val:'member',              label:'Member',              icon:'👁',  desc:'View only — no password needed' },
+  { val:'chairman',            label:'Chairman',            icon:'🏆',  desc:'Full access to everything' },
+  { val:'vice_chairman',       label:'Vice Chairman',       icon:'🥈',  desc:'View all pages' },
+  { val:'financial_secretary', label:'Financial Secretary', icon:'💰',  desc:'Members · Dues · Finance' },
+  { val:'secretary',           label:'Secretary',           icon:'📋',  desc:'Members · Meeting minutes' },
+  { val:'pro',                 label:'P.R.O.',              icon:'📢',  desc:'Meetings · Wall of Fame photos' },
+  { val:'captain',             label:'Captain',             icon:'⚽',  desc:'Meetings & fixtures' },
+  { val:'treasurer',           label:'Treasurer',           icon:'🏦',  desc:'Finance · Confirm payments' },
+];
+const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const PERMS = {
+  financial_secretary:{ members:true, dues:true, finance:true },
+  secretary:{ members:true, minutes:true },
+  pro:{ meetings:true, emeritus:true },
+  captain:{ meetings:true },
+  treasurer:{ finance:true },
+};
+const can = (role, perm) => role === 'chairman' || !!(PERMS[role] && PERMS[role][perm]);
+
+// ── UI PRIMITIVES ─────────────────────────────────────────────────────────────
+
+function Btn({ children, onClick, variant='primary', size='md', disabled, fullWidth, style }) {
+  const sizes = { sm:{fontSize:12,padding:'6px 12px'}, md:{fontSize:14,padding:'10px 18px'}, lg:{fontSize:16,padding:'13px 24px'} };
+  const variants = {
+    primary:{ background:C.blue, color:C.white, border:'none' },
+    gold:{ background:C.gold, color:C.white, border:'none' },
+    green:{ background:C.green, color:C.white, border:'none' },
+    red:{ background:C.red, color:C.white, border:'none' },
+    ghost:{ background:'transparent', color:C.blue, border:`1.5px solid ${C.blue}` },
+    muted:{ background:C.border, color:C.text, border:'none' },
+  };
+  return (
+    <button onClick={onClick} disabled={disabled} style={{
+      display:'inline-flex', alignItems:'center', justifyContent:'center', gap:6,
+      fontFamily:"'Oswald',sans-serif", fontWeight:700, letterSpacing:1,
+      borderRadius:8, cursor:disabled?'not-allowed':'pointer', opacity:disabled?0.5:1,
+      transition:'all 0.12s', width:fullWidth?'100%':undefined,
+      ...sizes[size], ...variants[variant], ...style,
+    }}>{children}</button>
+  );
+}
+
+function Inp({ value, onChange, placeholder, type='text', disabled, style }) {
+  return (
+    <input type={type} value={value} onChange={onChange} placeholder={placeholder} disabled={disabled} style={{
+      width:'100%', padding:'10px 12px', fontSize:14, border:`1.5px solid ${C.border}`,
+      borderRadius:8, background:disabled?C.bg:C.white, color:C.text, fontWeight:500, ...style,
+    }} />
+  );
+}
+
+function Sel({ value, onChange, children }) {
+  return (
+    <select value={value} onChange={onChange} style={{
+      width:'100%', padding:'10px 12px', fontSize:14, border:`1.5px solid ${C.border}`,
+      borderRadius:8, background:C.white, color:C.text, fontWeight:500,
+    }}>{children}</select>
+  );
+}
+
+function Field({ label, children, error }) {
+  return (
+    <div style={{ marginBottom:13 }}>
+      <div style={{ fontSize:11, fontWeight:700, letterSpacing:1, color:C.muted, marginBottom:5, fontFamily:"'Oswald',sans-serif" }}>{label.toUpperCase()}</div>
+      {children}
+      {error && <div style={{ fontSize:11, color:C.red, marginTop:3, fontWeight:600 }}>{error}</div>}
+    </div>
+  );
+}
+
+function Card({ children, style, onClick }) {
+  return (
+    <div onClick={onClick} style={{
+      background:C.card, borderRadius:12, border:`1px solid ${C.border}`,
+      boxShadow:'0 1px 3px rgba(0,0,0,0.06)', cursor:onClick?'pointer':undefined, ...style,
+    }}>{children}</div>
+  );
+}
+
+function Badge({ children, color='blue' }) {
+  const map = { blue:{bg:C.blueLight,text:C.blue}, gold:{bg:C.goldLight,text:C.gold}, green:{bg:C.greenLight,text:C.green}, red:{bg:C.redLight,text:C.red}, grey:{bg:C.border,text:C.muted} };
+  const { bg, text } = map[color]||map.blue;
+  return <span style={{ display:'inline-block', padding:'2px 8px', borderRadius:20, fontSize:11, fontWeight:700, background:bg, color:text }}>{children}</span>;
+}
+
+function Sheet({ open, onClose, title, children }) {
+  if (!open) return null;
+  return (
+    <div style={{ position:'fixed', inset:0, zIndex:1000, background:'rgba(0,0,0,0.45)', display:'flex', alignItems:'flex-end' }}
+      onClick={e => e.target===e.currentTarget && onClose()}>
+      <div style={{ width:'100%', maxWidth:520, margin:'0 auto', background:C.card, borderRadius:'16px 16px 0 0', padding:'20px 18px 36px', maxHeight:'88vh', overflowY:'auto' }}>
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:18 }}>
+          <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:15, fontWeight:700, letterSpacing:1.5, color:C.blue }}>{title}</div>
+          <button onClick={onClose} style={{ background:'none', border:'none', fontSize:22, color:C.muted, cursor:'pointer', lineHeight:1 }}>✕</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function PageHdr({ title, sub, right }) {
+  return (
+    <div style={{ background:`linear-gradient(135deg,${C.blue},#1e40af)`, padding:'16px 18px 14px', borderBottom:`3px solid ${C.goldBorder}`, display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+      <div>
+        <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:19, fontWeight:700, letterSpacing:2, color:C.white }}>{title}</div>
+        {sub && <div style={{ fontSize:12, color:'rgba(255,255,255,0.72)', marginTop:2, fontWeight:500 }}>{sub}</div>}
+      </div>
+      {right}
+    </div>
+  );
+}
+
+function Stat({ label, value, icon, color='blue', sub }) {
+  const map = { blue:{bg:C.blueLight,text:C.blue,br:'#93c5fd'}, gold:{bg:C.goldLight,text:C.gold,br:C.goldBorder}, green:{bg:C.greenLight,text:C.green,br:'#86efac'}, red:{bg:C.redLight,text:C.red,br:'#fca5a5'} };
+  const { bg, text, br } = map[color]||map.blue;
+  return (
+    <div style={{ background:bg, border:`1.5px solid ${br}`, borderRadius:12, padding:'13px 14px' }}>
+      <div style={{ fontSize:22 }}>{icon}</div>
+      <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:22, fontWeight:700, color:text, marginTop:4 }}>{value}</div>
+      <div style={{ fontSize:11, fontWeight:600, color:C.muted, marginTop:2 }}>{label}</div>
+      {sub && <div style={{ fontSize:11, color:C.muted, marginTop:1 }}>{sub}</div>}
+    </div>
+  );
+}
+
+function Empty({ icon, text }) {
+  return <div style={{ textAlign:'center', padding:'48px 20px', color:C.muted }}><div style={{ fontSize:40, marginBottom:10 }}>{icon}</div><div style={{ fontSize:14, fontWeight:600 }}>{text}</div></div>;
+}
+
+function Info({ text, type='info' }) {
+  const bg = { info:C.blueLight, error:C.redLight, success:C.greenLight };
+  const col = { info:C.blue, error:C.red, success:C.green };
+  return <div style={{ background:bg[type], color:col[type], padding:'10px 13px', borderRadius:8, fontSize:13, fontWeight:600, marginBottom:12 }}>{text}</div>;
+}
+
+function TabPills({ tabs, active, onChange }) {
+  return (
+    <div style={{ display:'flex', gap:8, flexWrap:'wrap' }}>
+      {tabs.map(([v,l]) => (
+        <button key={v} onClick={() => onChange(v)} style={{
+          padding:'5px 13px', borderRadius:16, fontSize:12, fontWeight:700, cursor:'pointer',
+          fontFamily:"'Oswald',sans-serif", letterSpacing:0.5,
+          border:`1.5px solid ${active===v?C.blue:C.border}`,
+          background:active===v?C.blue:C.white, color:active===v?C.white:C.muted,
+        }}>{l}</button>
+      ))}
+    </div>
+  );
+}
+
+// ── CONNECT SCREEN ────────────────────────────────────────────────────────────
+function ConnectScreen({ onConnected }) {
+  const [url, setUrl] = useState('');
+  const [key, setKey] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [help, setHelp] = useState(false);
+
+  const connect = () => {
+    if (!url.trim() || !key.trim()) { setErr('Both fields are required.'); return; }
+    setBusy(true); setErr('');
+    const ok = initSb({ url: url.trim(), anonKey: key.trim() });
+    if (ok) {
+      try { localStorage.setItem(SB_KEY, JSON.stringify({ url: url.trim(), anonKey: key.trim() })); } catch(e) {}
+      onConnected();
+    } else {
+      setErr('Could not connect. Check the URL and key, then try again.');
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ minHeight:'100vh', background:C.bg, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', padding:'28px 16px' }}>
+      <div style={{ textAlign:'center', marginBottom:28 }}>
+        <div style={{ fontSize:52, marginBottom:8 }}>⚽</div>
+        <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:28, fontWeight:700, letterSpacing:3, color:C.blue }}>ARO ALL STARS</div>
+        <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:15, fontWeight:600, letterSpacing:2, color:C.gold }}>ABA FC</div>
+        <div style={{ fontSize:12, color:C.muted, marginTop:4, fontWeight:500 }}>MOTTO: HEALTH IS WEALTH</div>
+      </div>
+
+      <Card style={{ width:'100%', maxWidth:420, padding:'28px 22px' }}>
+        <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:15, fontWeight:700, letterSpacing:1.5, color:C.blue, marginBottom:18, textAlign:'center' }}>
+          CONNECT TO LIVE DATABASE
+        </div>
+
+        <button onClick={() => setHelp(h=>!h)} style={{
+          width:'100%', textAlign:'left', background:C.blueLight, border:'none', borderRadius:8,
+          padding:'9px 13px', marginBottom:14, cursor:'pointer', fontSize:13, fontWeight:700, color:C.blue,
+        }}>{help ? '▲ Hide instructions' : '▼ Where do I get these values?'}</button>
+
+        {help && (
+          <div style={{ fontSize:13, color:C.muted, lineHeight:1.8, marginBottom:14, background:C.bg, padding:'13px 14px', borderRadius:8, fontWeight:500 }}>
+            1. Go to <strong>supabase.com</strong> → open your project<br/>
+            2. Click <strong>Project Settings → API</strong><br/>
+            3. Copy the <strong>Project URL</strong> (starts with https://)<br/>
+            4. Copy the <strong>anon public</strong> key (starts with eyJ…)<br/>
+            5. Paste both below and tap Connect
+          </div>
+        )}
+
+        <Field label="Supabase Project URL">
+          <Inp value={url} onChange={e=>setUrl(e.target.value)} placeholder="https://xxxxxxxx.supabase.co" />
+        </Field>
+        <Field label="Anon Public Key">
+          <Inp value={key} onChange={e=>setKey(e.target.value)} placeholder="eyJhbGciOi…" />
+        </Field>
+
+        {err && <Info text={err} type="error" />}
+        <Btn onClick={connect} disabled={busy} fullWidth size="lg">
+          {busy ? 'Connecting…' : 'Connect & Open App →'}
+        </Btn>
+      </Card>
+
+      <div style={{ fontSize:11.5, color:C.muted, textAlign:'center', marginTop:16, maxWidth:340, fontWeight:500, lineHeight:1.7 }}>
+        This device remembers the connection. Other members who open the same app link don't need to set this up.
+      </div>
+    </div>
+  );
+}
+
+// ── LOGIN SCREEN ──────────────────────────────────────────────────────────────
+function LoginScreen({ onLogin, passwords }) {
+  const [sel, setSel] = useState(null);
+  const [pw, setPw] = useState('');
+  const [show, setShow] = useState(false);
+  const [err, setErr] = useState('');
+
+  const pick = r => {
+    if (r.val === 'member') { onLogin('member'); return; }
+    setSel(r); setPw(''); setErr('');
+  };
+
+  const submit = () => {
+    const correct = (passwords && passwords[sel.val]) || DEFAULT_PWS[sel.val];
+    if (pw === correct) onLogin(sel.val);
+    else { setErr('Incorrect password. Try again.'); setPw(''); }
+  };
+
+  return (
+    <div style={{ minHeight:'100vh', background:C.bg, display:'flex', flexDirection:'column' }}>
+      <div style={{ background:`linear-gradient(135deg,${C.blue},#1e40af)`, padding:'32px 20px 24px', textAlign:'center', borderBottom:`3px solid ${C.goldBorder}` }}>
+        <div style={{ fontSize:44 }}>⚽</div>
+        <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:26, fontWeight:700, letterSpacing:3, color:C.white, marginTop:10 }}>ARO ALL STARS</div>
+        <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:14, fontWeight:600, letterSpacing:2, color:C.goldBorder }}>ABA FC · HEALTH IS WEALTH</div>
+      </div>
+
+      <div style={{ flex:1, padding:'20px 16px', maxWidth:480, width:'100%', margin:'0 auto' }}>
+        {!sel ? (
+          <>
+            <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:13, fontWeight:700, letterSpacing:2, color:C.muted, marginBottom:12 }}>SELECT YOUR ROLE</div>
+            {ROLES_LIST.map(r => (
+              <Card key={r.val} style={{ marginBottom:8, padding:'13px 16px', display:'flex', alignItems:'center', gap:14 }} onClick={() => pick(r)}>
+                <span style={{ fontSize:24 }}>{r.icon}</span>
+                <div style={{ flex:1 }}>
+                  <div style={{ fontWeight:700, fontSize:14, color:C.text }}>{r.label}</div>
+                  <div style={{ fontSize:12, color:C.muted, marginTop:2, fontWeight:500 }}>{r.desc}</div>
+                </div>
+                <span style={{ color:C.muted, fontSize:20 }}>›</span>
+              </Card>
+            ))}
+          </>
+        ) : (
+          <Card style={{ padding:'26px 20px', marginTop:16 }}>
+            <button onClick={() => setSel(null)} style={{ background:'none', border:'none', color:C.blue, fontSize:13, fontWeight:700, cursor:'pointer', marginBottom:18, display:'flex', alignItems:'center', gap:4 }}>
+              ‹ Back to roles
+            </button>
+            <div style={{ textAlign:'center', marginBottom:22 }}>
+              <div style={{ fontSize:40 }}>{sel.icon}</div>
+              <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:20, fontWeight:700, color:C.blue, marginTop:10 }}>{sel.label}</div>
+              <div style={{ fontSize:13, color:C.muted, fontWeight:500, marginTop:4 }}>Enter your password to continue</div>
+            </div>
+            <Field label="Password" error={err}>
+              <div style={{ position:'relative' }}>
+                <Inp type={show?'text':'password'} value={pw} onChange={e => { setPw(e.target.value); setErr(''); }} placeholder="Enter password" />
+                <button onClick={() => setShow(s=>!s)} style={{ position:'absolute', right:10, top:'50%', transform:'translateY(-50%)', background:'none', border:'none', fontSize:17, cursor:'pointer', color:C.muted }}>
+                  {show ? '🙈' : '👁'}
+                </button>
+              </div>
+            </Field>
+            <Btn onClick={submit} fullWidth size="lg">Enter App →</Btn>
+            <div style={{ fontSize:12, color:C.muted, textAlign:'center', marginTop:14, fontWeight:500 }}>Forgot your password? Contact the Chairman.</div>
+          </Card>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── BOTTOM NAV ──────────────────────────────────────────────────────────────
+const NAV_ITEMS = [
+  { key:'home',     icon:'🏠', label:'Home' },
+  { key:'members',  icon:'👥', label:'Members' },
+  { key:'dues',     icon:'💳', label:'Dues' },
+  { key:'finance',  icon:'💰', label:'Finance' },
+  { key:'meetings', icon:'📅', label:'Meetings' },
+  { key:'emeritus', icon:'🏆', label:'Fame' },
+  { key:'settings', icon:'⚙️', label:'Settings' },
+];
+
+function NavBar({ page, onNav }) {
+  return (
+    <div style={{ position:'fixed', bottom:0, left:0, right:0, zIndex:200, background:C.white, borderTop:`2px solid ${C.border}`, display:'flex', boxShadow:'0 -2px 12px rgba(0,0,0,0.08)', maxWidth:520, margin:'0 auto' }}>
+      {NAV_ITEMS.map(n => {
+        const on = page === n.key;
+        return (
+          <button key={n.key} onClick={() => onNav(n.key)} style={{
+            flex:1, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center',
+            padding:'8px 2px 6px', border:'none', cursor:'pointer',
+            background:on?C.blueLight:'transparent',
+            borderTop:`2px solid ${on?C.blue:'transparent'}`,
+          }}>
+            <span style={{ fontSize:17 }}>{n.icon}</span>
+            <span style={{ fontSize:9, fontWeight:700, letterSpacing:0.5, color:on?C.blue:C.muted, fontFamily:"'Oswald',sans-serif", marginTop:1 }}>{n.label}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── HOME PAGE ────────────────────────────────────────────────────────────────
+function HomePage({ members, dues, finance, settings, role, onNav }) {
+  const now = new Date();
+  const mk = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+  const active = members.filter(m => m.status==='active');
+  const paidNow = active.filter(m => dues[m.id] && dues[m.id][mk] && dues[m.id][mk].paid).length;
+  const balance = (finance||[]).reduce((s,t) => s+(t.type==='income'?t.amount:-t.amount), 0);
+
+  return (
+    <div>
+      <div style={{ background:`linear-gradient(135deg,${C.blue},#1e40af)`, padding:'20px 18px', borderBottom:`3px solid ${C.goldBorder}` }}>
+        <div style={{ display:'flex', alignItems:'center', gap:14 }}>
+          <span style={{ fontSize:44 }}>⚽</span>
+          <div>
+            <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:22, fontWeight:700, letterSpacing:2, color:C.white }}>ARO ALL STARS ABA FC</div>
+            <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:12, fontWeight:600, letterSpacing:1.5, color:C.goldBorder }}>HEALTH IS WEALTH</div>
+          </div>
+        </div>
+        <div style={{ marginTop:10, fontSize:12, color:'rgba(255,255,255,0.7)', fontWeight:500 }}>
+          Signed in as <strong style={{ color:C.white }}>{role.replace(/_/g,' ').toUpperCase()}</strong> · {MONTHS[now.getMonth()]} {now.getFullYear()}
+        </div>
+      </div>
+
+      <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12, padding:'16px 16px 12px' }}>
+        <Stat label="Total Members" value={members.length} icon="👥" color="blue" sub={`${active.length} active`} />
+        <Stat label="Paid This Month" value={paidNow} icon="💳" color="green" sub={`of ${active.length} active`} />
+        <Stat label="Unpaid This Month" value={active.length - paidNow} icon="⚠️" color="red" />
+        <Stat label="Club Balance" value={`₦${Math.abs(balance).toLocaleString()}`} icon="💰" color="gold" sub={balance<0?'deficit':undefined} />
+      </div>
+
+      <div style={{ padding:'0 16px 16px' }}>
+        <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:12, fontWeight:700, letterSpacing:1.5, color:C.muted, marginBottom:10 }}>QUICK ACCESS</div>
+        <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10 }}>
+          {[['members','👥','Members'],['dues','💳','Dues'],['finance','💰','Finance'],['meetings','📅','Meetings']].map(([k,ic,lb]) => (
+            <button key={k} onClick={() => onNav(k)} style={{ background:C.white, border:`1.5px solid ${C.border}`, borderRadius:12, padding:'16px 12px', display:'flex', flexDirection:'column', alignItems:'center', gap:7, cursor:'pointer' }}>
+              <span style={{ fontSize:26 }}>{ic}</span>
+              <span style={{ fontFamily:"'Oswald',sans-serif", fontSize:12, fontWeight:700, letterSpacing:1, color:C.blue }}>{lb}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── MEMBERS PAGE ─────────────────────────────────────────────────────────────
+function MembersPage({ members, setMembers, role }) {
+  const [search, setSearch] = useState('');
+  const [tab, setTab] = useState('active');
+  const [sheet, setSheet] = useState(false);
+  const [editId, setEditId] = useState(null);
+  const [form, setForm] = useState({ name:'', memberRole:'Player', joinDate:'', phone:'', email:'', occupation:'', status:'active' });
+  const canEdit = can(role,'members');
+  const u = (k,v) => setForm(p=>({...p,[k]:v}));
+
+  const openAdd = () => { setForm({ name:'', memberRole:'Player', joinDate:'', phone:'', email:'', occupation:'', status:'active' }); setEditId(null); setSheet(true); };
+  const openEdit = m => { setForm({ name:m.name, memberRole:m.memberRole||'Player', joinDate:m.joinDate||'', phone:m.phone||'', email:m.email||'', occupation:m.occupation||'', status:m.status||'active' }); setEditId(m.id); setSheet(true); };
+  const save = () => {
+    if (!form.name.trim()) return;
+    if (editId) setMembers(p => p.map(m => m.id===editId ? {...m,...form,name:form.name.trim()} : m));
+    else setMembers(p => [...p, {...form, name:form.name.trim(), id:Date.now()}]);
+    setSheet(false);
+  };
+  const del = id => { if (window.confirm('Remove this member?')) setMembers(p=>p.filter(m=>m.id!==id)); };
+
+  const counts = { active:members.filter(m=>m.status==='active').length, inactive:members.filter(m=>m.status==='inactive').length, all:members.length };
+  const list = members.filter(m => (!search || m.name.toLowerCase().includes(search.toLowerCase())) && (tab==='all'||m.status===tab));
+
+  return (
+    <div>
+      <PageHdr title="MEMBERS" sub={`${members.length} total`} right={canEdit && <Btn size="sm" variant="gold" onClick={openAdd}>+ Add</Btn>} />
+      <div style={{ padding:'12px 16px 0' }}>
+        <Inp value={search} onChange={e=>setSearch(e.target.value)} placeholder="🔍  Search members…" />
+      </div>
+      <div style={{ padding:'10px 16px 8px' }}>
+        <TabPills tabs={[['active',`Active (${counts.active})`],['inactive',`Inactive (${counts.inactive})`],['all',`All (${counts.all})`]]} active={tab} onChange={setTab} />
+      </div>
+      <div style={{ padding:'0 16px 100px' }}>
+        {list.length===0 && <Empty icon="👥" text="No members found" />}
+        {list.map(m => (
+          <Card key={m.id} style={{ marginBottom:8, padding:'12px 14px' }}>
+            <div style={{ display:'flex', alignItems:'center', gap:12 }}>
+              <div style={{ width:42, height:42, borderRadius:'50%', background:C.blueLight, display:'flex', alignItems:'center', justifyContent:'center', fontFamily:"'Oswald',sans-serif", fontWeight:700, fontSize:17, color:C.blue, flexShrink:0 }}>
+                {m.name.charAt(0).toUpperCase()}
+              </div>
+              <div style={{ flex:1, minWidth:0 }}>
+                <div style={{ fontWeight:700, fontSize:14, color:C.text, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{m.name}</div>
+                <div style={{ fontSize:12, color:C.muted, fontWeight:500, marginTop:2 }}>{m.memberRole}{m.phone?` · ${m.phone}`:''}</div>
+              </div>
+              <div style={{ display:'flex', alignItems:'center', gap:8, flexShrink:0 }}>
+                <Badge color={m.status==='active'?'green':'grey'}>{m.status}</Badge>
+                {canEdit && <>
+                  <button onClick={()=>openEdit(m)} style={{ background:'none', border:'none', fontSize:15, cursor:'pointer', color:C.blue }}>✏️</button>
+                  <button onClick={()=>del(m.id)} style={{ background:'none', border:'none', fontSize:15, cursor:'pointer', color:C.muted }}>🗑️</button>
+                </>}
+              </div>
+            </div>
+          </Card>
+        ))}
+      </div>
+
+      <Sheet open={sheet} onClose={()=>setSheet(false)} title={editId?'EDIT MEMBER':'ADD MEMBER'}>
+        <Field label="Full Name"><Inp value={form.name} onChange={e=>u('name',e.target.value)} placeholder="e.g. John Okafor" /></Field>
+        <Field label="Role"><Sel value={form.memberRole} onChange={e=>u('memberRole',e.target.value)}>{['Player','Official','Patron','Associate'].map(r=><option key={r}>{r}</option>)}</Sel></Field>
+        <Field label="Status"><Sel value={form.status} onChange={e=>u('status',e.target.value)}>{['active','inactive','suspended'].map(s=><option key={s}>{s}</option>)}</Sel></Field>
+        <Field label="Join Date"><Inp type="date" value={form.joinDate} onChange={e=>u('joinDate',e.target.value)} /></Field>
+        <Field label="Phone"><Inp value={form.phone} onChange={e=>u('phone',e.target.value)} placeholder="08012345678" /></Field>
+        <Field label="Email"><Inp value={form.email} onChange={e=>u('email',e.target.value)} placeholder="email@example.com" /></Field>
+        <Field label="Occupation"><Inp value={form.occupation} onChange={e=>u('occupation',e.target.value)} placeholder="e.g. Engineer" /></Field>
+        <div style={{ display:'flex', gap:10, marginTop:6 }}>
+          <Btn onClick={()=>setSheet(false)} variant="muted" fullWidth>Cancel</Btn>
+          <Btn onClick={save} variant="primary" fullWidth>{editId?'Save Changes':'Add Member'}</Btn>
+        </div>
+      </Sheet>
+    </div>
+  );
+}
+
+// ── DUES PAGE ─────────────────────────────────────────────────────────────────
+function DuesPage({ members, dues, setDues, role, settings }) {
+  const now = new Date();
+  const [year, setYear] = useState(now.getFullYear());
+  const [month, setMonth] = useState(now.getMonth());
+  const [tab, setTab] = useState('unpaid');
+  const canEdit = can(role,'dues');
+  const rate = (settings && settings.monthlyDues) || 500;
+  const mk = `${year}-${String(month+1).padStart(2,'0')}`;
+  const active = members.filter(m=>m.status==='active');
+  const paid = active.filter(m=>dues[m.id] && dues[m.id][mk] && dues[m.id][mk].paid);
+  const unpaid = active.filter(m=>!dues[m.id] && dues[m.id][mk] && dues[m.id][mk].paid);
+  const list = tab==='paid'?paid:tab==='unpaid'?unpaid:active;
+
+  const toggle = id => {
+    if (!canEdit) return;
+    setDues(p => ({ ...p, [id]: { ...(p[id]||{}), [mk]: { paid:!(p[id] && p[id][mk] && p[id][mk].paid), amount:rate, date:new Date().toISOString() } } }));
+  };
+  const markAll = val => {
+    if (!canEdit) return;
+    const upd = {...dues};
+    active.forEach(m => { upd[m.id] = {...(upd[m.id]||{}), [mk]:{ paid:val, amount:rate, date:new Date().toISOString() }}; });
+    setDues(upd);
+  };
+
+  return (
+    <div>
+      <PageHdr title="MONTHLY DUES" sub={`₦${rate.toLocaleString()} per member/month`} />
+
+      <div style={{ background:C.white, borderBottom:`1px solid ${C.border}`, padding:'11px 16px', display:'flex', alignItems:'center', gap:10 }}>
+        <button onClick={()=>{ if(month===0){setMonth(11);setYear(y=>y-1);}else setMonth(m=>m-1); }} style={{ width:34,height:34,border:'none',borderRadius:8,background:C.blueLight,color:C.blue,fontSize:18,cursor:'pointer',fontWeight:700 }}>‹</button>
+        <div style={{ flex:1, textAlign:'center', fontFamily:"'Oswald',sans-serif", fontWeight:700, fontSize:17, color:C.blue }}>{MONTHS[month]} {year}</div>
+        <button onClick={()=>{ if(month===11){setMonth(0);setYear(y=>y+1);}else setMonth(m=>m+1); }} style={{ width:34,height:34,border:'none',borderRadius:8,background:C.blueLight,color:C.blue,fontSize:18,cursor:'pointer',fontWeight:700 }}>›</button>
+      </div>
+
+      <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:8, padding:'12px 16px 8px' }}>
+        {[[paid.length,'Paid',C.greenLight,C.green],[unpaid.length,'Unpaid',C.redLight,C.red],[`₦${(paid.length*rate).toLocaleString()}`,'Collected',C.goldLight,C.gold]].map(([v,l,bg,col])=>(
+          <div key={l} style={{ background:bg, borderRadius:10, padding:'10px', textAlign:'center' }}>
+            <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:18, fontWeight:700, color:col }}>{v}</div>
+            <div style={{ fontSize:11, fontWeight:600, color:col }}>{l}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ padding:'0 16px 8px', display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' }}>
+        <TabPills tabs={[['unpaid','Unpaid'],['paid','Paid'],['all','All']]} active={tab} onChange={setTab} />
+        {canEdit && <div style={{ marginLeft:'auto', display:'flex', gap:6 }}>
+          <Btn size="sm" variant="green" onClick={()=>markAll(true)}>✓ All</Btn>
+          <Btn size="sm" variant="muted" onClick={()=>markAll(false)}>✗ All</Btn>
+        </div>}
+      </div>
+
+      <div style={{ padding:'0 16px 100px' }}>
+        {list.length===0 && <Empty icon="💳" text="No members here" />}
+        {list.map(m => {
+          const isPaid = !!(dues[m.id] && dues[m.id][mk] && dues[m.id][mk].paid);
+          return (
+            <Card key={m.id} style={{ marginBottom:8, padding:'11px 14px', display:'flex', alignItems:'center', gap:12 }}>
+              <div style={{ flex:1 }}>
+                <div style={{ fontWeight:700, fontSize:14, color:C.text }}>{m.name}</div>
+                <div style={{ fontSize:12, color:C.muted, fontWeight:500 }}>{m.memberRole}</div>
+              </div>
+              <Badge color={isPaid?'green':'red'}>{isPaid?`₦${rate.toLocaleString()} Paid`:'Unpaid'}</Badge>
+              {canEdit && (
+                <button onClick={()=>toggle(m.id)} style={{ width:34, height:34, borderRadius:8, border:`2px solid ${isPaid?C.green:C.border}`, background:isPaid?C.green:C.white, cursor:'pointer', fontSize:16, display:'flex', alignItems:'center', justifyContent:'center', color:isPaid?C.white:C.muted }}>
+                  {isPaid?'✓':'○'}
+                </button>
+              )}
+            </Card>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ── FINANCE PAGE ──────────────────────────────────────────────────────────────
+function FinancePage({ finance, setFinance, role }) {
+  const [sheet, setSheet] = useState(false);
+  const [tab, setTab] = useState('all');
+  const [form, setForm] = useState({ type:'income', desc:'', amount:'', date:new Date().toISOString().slice(0,10) });
+  const canEdit = can(role,'finance');
+  const u = (k,v) => setForm(p=>({...p,[k]:v}));
+
+  const totalIn = finance.filter(t=>t.type==='income').reduce((s,t)=>s+t.amount,0);
+  const totalOut = finance.filter(t=>t.type==='expense').reduce((s,t)=>s+t.amount,0);
+  const balance = totalIn - totalOut;
+  const list = finance.filter(t=>tab==='all'||t.type===tab);
+
+  const save = () => {
+    if (!form.desc||!form.amount) return;
+    setFinance(p=>[{...form,amount:Number(form.amount),id:Date.now()},...p]);
+    setSheet(false);
+  };
+  const del = id => { if(window.confirm('Delete transaction?')) setFinance(p=>p.filter(t=>t.id!==id)); };
+
+  return (
+    <div>
+      <PageHdr title="FINANCE" sub="Club income & expenses" right={canEdit && <Btn size="sm" variant="gold" onClick={()=>{ setForm({type:'income',desc:'',amount:'',date:new Date().toISOString().slice(0,10)}); setSheet(true); }}>+ Add</Btn>} />
+
+      <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:8, padding:'13px 16px 8px' }}>
+        {[[`₦${totalIn.toLocaleString()}`,'Income',C.greenLight,C.green],[`₦${totalOut.toLocaleString()}`,'Expenses',C.redLight,C.red],[`₦${Math.abs(balance).toLocaleString()}`,balance>=0?'Balance':'Deficit',balance>=0?C.goldLight:C.redLight,balance>=0?C.gold:C.red]].map(([v,l,bg,col])=>(
+          <div key={l} style={{ background:bg, borderRadius:10, padding:'10px', textAlign:'center' }}>
+            <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:15, fontWeight:700, color:col }}>{v}</div>
+            <div style={{ fontSize:11, fontWeight:600, color:col }}>{l}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ padding:'4px 16px 10px' }}>
+        <TabPills tabs={[['all','All'],['income','Income'],['expense','Expenses']]} active={tab} onChange={setTab} />
+      </div>
+
+      <div style={{ padding:'0 16px 100px' }}>
+        {list.length===0 && <Empty icon="💰" text="No transactions yet" />}
+        {list.map(t => (
+          <Card key={t.id} style={{ marginBottom:8, padding:'12px 14px', display:'flex', alignItems:'center', gap:12 }}>
+            <span style={{ fontSize:24 }}>{t.type==='income'?'📈':'📉'}</span>
+            <div style={{ flex:1, minWidth:0 }}>
+              <div style={{ fontWeight:700, fontSize:14, color:C.text, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{t.desc}</div>
+              <div style={{ fontSize:12, color:C.muted, fontWeight:500 }}>{t.date}</div>
+            </div>
+            <div style={{ textAlign:'right', flexShrink:0 }}>
+              <div style={{ fontFamily:"'Oswald',sans-serif", fontWeight:700, fontSize:15, color:t.type==='income'?C.green:C.red }}>
+                {t.type==='income'?'+':'-'}₦{Number(t.amount).toLocaleString()}
+              </div>
+              {canEdit && <button onClick={()=>del(t.id)} style={{ background:'none', border:'none', fontSize:13, cursor:'pointer', color:C.muted }}>🗑️</button>}
+            </div>
+          </Card>
+        ))}
+      </div>
+
+      <Sheet open={sheet} onClose={()=>setSheet(false)} title="ADD TRANSACTION">
+        <Field label="Type">
+          <div style={{ display:'flex', gap:10 }}>
+            {['income','expense'].map(t=>(
+              <button key={t} onClick={()=>u('type',t)} style={{ flex:1, padding:'10px', borderRadius:8, cursor:'pointer', fontWeight:700, fontSize:13, fontFamily:"'Oswald',sans-serif", letterSpacing:1, border:`2px solid ${form.type===t?(t==='income'?C.green:C.red):C.border}`, background:form.type===t?(t==='income'?C.greenLight:C.redLight):C.white, color:form.type===t?(t==='income'?C.green:C.red):C.muted }}>
+                {t==='income'?'📈 Income':'📉 Expense'}
+              </button>
+            ))}
+          </div>
+        </Field>
+        <Field label="Description"><Inp value={form.desc} onChange={e=>u('desc',e.target.value)} placeholder="e.g. Monthly dues collected" /></Field>
+        <Field label="Amount (₦)"><Inp type="number" value={form.amount} onChange={e=>u('amount',e.target.value)} placeholder="0" /></Field>
+        <Field label="Date"><Inp type="date" value={form.date} onChange={e=>u('date',e.target.value)} /></Field>
+        <div style={{ display:'flex', gap:10, marginTop:6 }}>
+          <Btn onClick={()=>setSheet(false)} variant="muted" fullWidth>Cancel</Btn>
+          <Btn onClick={save} variant="primary" fullWidth>Save</Btn>
+        </div>
+      </Sheet>
+    </div>
+  );
+}
+
+// ── MEETINGS PAGE ─────────────────────────────────────────────────────────────
+function MeetingsPage({ meetings, setMeetings, members, role, settings }) {
+  const [sheet, setSheet] = useState(false);
+  const [viewId, setViewId] = useState(null);
+  const [form, setForm] = useState({ title:'', date:new Date().toISOString().slice(0,10), type:'regular', notes:'' });
+  const canEdit = can(role,'meetings');
+  const u = (k,v) => setForm(p=>({...p,[k]:v}));
+  const fee = (settings && settings.meetingLatenessFee) || 200;
+  const active = members.filter(m=>m.status==='active');
+
+  const save = () => {
+    if (!form.title) return;
+    setMeetings(p=>[{...form, id:Date.now(), attendance:{}, late:{}}, ...p]);
+    setSheet(false);
+  };
+  const del = id => { if(window.confirm('Delete meeting?')) setMeetings(p=>p.filter(m=>m.id!==id)); };
+  const toggleAtt = (mid, mbid) => {
+    if (!canEdit) return;
+    setMeetings(p=>p.map(m=>m.id!==mid?m:{...m,attendance:{...(m.attendance||{}),[mbid]:!(m.attendance && m.attendance[mbid])}}));
+  };
+  const toggleLate = (mid, mbid) => {
+    if (!canEdit) return;
+    setMeetings(p=>p.map(m=>m.id!==mid?m:{...m,late:{...(m.late||{}),[mbid]:!(m.late && m.late[mbid])}}));
+  };
+
+  const vm = meetings.find(m=>m.id===viewId);
+
+  if (vm) {
+    const present = active.filter(m=>vm.attendance && vm.attendance[m.id]);
+    const late = active.filter(m=>vm.late && vm.late[m.id]);
+    const absent = active.filter(m=>!vm.attendance && vm.attendance[m.id]);
+    return (
+      <div>
+        <div style={{ background:`linear-gradient(135deg,${C.blue},#1e40af)`, padding:'16px 18px', borderBottom:`3px solid ${C.goldBorder}`, display:'flex', alignItems:'center', gap:12 }}>
+          <button onClick={()=>setViewId(null)} style={{ background:'none', border:'none', color:C.white, fontSize:24, cursor:'pointer', lineHeight:1 }}>‹</button>
+          <div>
+            <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:16, fontWeight:700, letterSpacing:1.5, color:C.white }}>{vm.title}</div>
+            <div style={{ fontSize:12, color:'rgba(255,255,255,0.72)' }}>{vm.date} · {vm.type}</div>
+          </div>
+        </div>
+        <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:8, padding:'12px 16px 8px' }}>
+          {[[present.length,'Present',C.greenLight,C.green],[absent.length,'Absent',C.redLight,C.red],[late.length,'Late',C.goldLight,C.gold]].map(([v,l,bg,col])=>(
+            <div key={l} style={{ background:bg, borderRadius:10, padding:'10px', textAlign:'center' }}>
+              <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:22, fontWeight:700, color:col }}>{v}</div>
+              <div style={{ fontSize:11, fontWeight:600, color:col }}>{l}</div>
+            </div>
+          ))}
+        </div>
+        <div style={{ padding:'4px 16px', fontFamily:"'Oswald',sans-serif", fontSize:12, fontWeight:700, letterSpacing:1.5, color:C.muted, marginBottom:6 }}>ATTENDANCE — tap to mark</div>
+        <div style={{ padding:'0 16px 100px' }}>
+          {active.map(m => {
+            const isP = !!vm.attendance && vm.attendance[m.id], isL = !!vm.late && vm.late[m.id];
+            return (
+              <Card key={m.id} style={{ marginBottom:8, padding:'10px 14px', display:'flex', alignItems:'center', gap:10 }}>
+                <div style={{ flex:1 }}>
+                  <div style={{ fontWeight:700, fontSize:13, color:C.text }}>{m.name}</div>
+                  {isL && <div style={{ fontSize:11, color:C.gold, fontWeight:600 }}>Late · ₦{fee.toLocaleString()} fee</div>}
+                </div>
+                <button onClick={()=>toggleLate(vm.id,m.id)} style={{ padding:'5px 9px', borderRadius:6, border:`2px solid ${isL?C.gold:C.border}`, background:isL?C.goldLight:C.white, cursor:canEdit?'pointer':'default', fontSize:12, fontWeight:700, color:isL?C.gold:C.muted }}>Late</button>
+                <button onClick={()=>toggleAtt(vm.id,m.id)} style={{ width:34, height:34, borderRadius:8, border:`2px solid ${isP?C.green:C.border}`, background:isP?C.green:C.white, cursor:canEdit?'pointer':'default', fontSize:16, display:'flex', alignItems:'center', justifyContent:'center', color:isP?C.white:C.muted }}>{isP?'✓':'○'}</button>
+              </Card>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <PageHdr title="MEETINGS" sub={`${meetings.length} recorded`} right={canEdit && <Btn size="sm" variant="gold" onClick={()=>{ setForm({title:'',date:new Date().toISOString().slice(0,10),type:'regular',notes:''}); setSheet(true); }}>+ Add</Btn>} />
+      <div style={{ padding:'14px 16px 100px' }}>
+        {meetings.length===0 && <Empty icon="📅" text="No meetings recorded yet" />}
+        {meetings.map(m => {
+          const total = active.length;
+          const present = Object.values(m.attendance||{}).filter(Boolean).length;
+          return (
+            <Card key={m.id} style={{ marginBottom:8, padding:'12px 14px', display:'flex', alignItems:'center', gap:12, cursor:'pointer' }} onClick={()=>setViewId(m.id)}>
+              <span style={{ fontSize:28 }}>📅</span>
+              <div style={{ flex:1 }}>
+                <div style={{ fontWeight:700, fontSize:14, color:C.text }}>{m.title}</div>
+                <div style={{ fontSize:12, color:C.muted, fontWeight:500, marginTop:2 }}>{m.date} · {present}/{total} present</div>
+              </div>
+              <div style={{ display:'flex', gap:6, alignItems:'center' }}>
+                <Badge color={m.type==='emergency'?'red':'blue'}>{m.type}</Badge>
+                {canEdit && <button onClick={e=>{e.stopPropagation();del(m.id);}} style={{ background:'none', border:'none', fontSize:15, cursor:'pointer', color:C.muted }}>🗑️</button>}
+              </div>
+            </Card>
+          );
+        })}
+      </div>
+      <Sheet open={sheet} onClose={()=>setSheet(false)} title="NEW MEETING">
+        <Field label="Title"><Inp value={form.title} onChange={e=>u('title',e.target.value)} placeholder="e.g. Monthly General Meeting" /></Field>
+        <Field label="Date"><Inp type="date" value={form.date} onChange={e=>u('date',e.target.value)} /></Field>
+        <Field label="Type"><Sel value={form.type} onChange={e=>u('type',e.target.value)}><option value="regular">Regular</option><option value="emergency">Emergency</option><option value="agm">AGM</option></Sel></Field>
+        <Field label="Notes (optional)">
+          <textarea value={form.notes} onChange={e=>u('notes',e.target.value)} placeholder="Agenda or notes…" style={{ width:'100%', padding:'10px 12px', fontSize:14, border:`1.5px solid ${C.border}`, borderRadius:8, minHeight:80, resize:'vertical', fontFamily:"'Inter',sans-serif" }} />
+        </Field>
+        <div style={{ display:'flex', gap:10, marginTop:6 }}>
+          <Btn onClick={()=>setSheet(false)} variant="muted" fullWidth>Cancel</Btn>
+          <Btn onClick={save} variant="primary" fullWidth>Create Meeting</Btn>
+        </div>
+      </Sheet>
+    </div>
+  );
+}
+
+// ── EMERITUS PAGE ─────────────────────────────────────────────────────────────
+function EmeritusPage({ emeritus, setEmeritus, role }) {
+  const [sheet, setSheet] = useState(false);
+  const [editId, setEditId] = useState(null);
+  const [form, setForm] = useState({ name:'', tenure:'', year:'', photo:'' });
+  const [uploading, setUploading] = useState(false);
+  const [upErr, setUpErr] = useState('');
+  const canEdit = can(role,'emeritus');
+  const u = (k,v) => setForm(p=>({...p,[k]:v}));
+
+  const openAdd = () => { setForm({name:'',tenure:'',year:'',photo:''}); setEditId(null); setUpErr(''); setSheet(true); };
+  const openEdit = e => { setForm({name:e.name||'',tenure:e.tenure||'',year:e.year||'',photo:e.photo||''}); setEditId(e.id); setUpErr(''); setSheet(true); };
+  const save = () => {
+    if (!form.name||!form.tenure) return;
+    if (editId) setEmeritus(p=>p.map(e=>e.id===editId?{...e,...form}:e));
+    else setEmeritus(p=>[...p,{...form,id:Date.now()}]);
+    setSheet(false);
+  };
+  const del = id => { if(window.confirm('Remove from Wall of Fame?')) setEmeritus(p=>p.filter(e=>e.id!==id)); };
+  const handlePhoto = async file => {
+    if (!file) return;
+    setUploading(true); setUpErr('');
+    try { const url = await uploadPhoto(file,'emeritus'); setForm(p=>({...p,photo:url})); }
+    catch(e) { setUpErr(e.message||'Upload failed. Try again.'); }
+    finally { setUploading(false); }
+  };
+
+  return (
+    <div>
+      <PageHdr title="WALL OF FAME" sub="Past Chairmen — Emeritus" right={canEdit && <Btn size="sm" variant="gold" onClick={openAdd}>+ Add</Btn>} />
+      {!canEdit && (
+        <div style={{ padding:'10px 16px', background:C.goldLight, borderBottom:`1px solid ${C.goldBorder}` }}>
+          <div style={{ fontSize:12, fontWeight:600, color:C.gold }}>📷 Entries and photos managed by Chairman or P.R.O.</div>
+        </div>
+      )}
+      <div style={{ padding:'16px 16px 100px' }}>
+        {emeritus.length===0 && <Empty icon="🏆" text="No past chairmen recorded yet" />}
+        {emeritus.map((e,i) => (
+          <Card key={e.id} style={{ marginBottom:12, overflow:'hidden', border:`1.5px solid ${C.goldBorder}` }}>
+            <div style={{ background:`linear-gradient(135deg,${C.blue},#1e40af)`, padding:'5px 14px', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+              <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:11, fontWeight:700, letterSpacing:2, color:C.goldBorder }}>PAST CHAIRMAN #{i+1}</div>
+              {canEdit && <div style={{ display:'flex', gap:8 }}>
+                <button onClick={()=>openEdit(e)} style={{ background:'none', border:'none', fontSize:14, cursor:'pointer', color:C.white }}>✏️</button>
+                <button onClick={()=>del(e.id)} style={{ background:'none', border:'none', fontSize:14, cursor:'pointer', color:'rgba(255,255,255,0.55)' }}>🗑️</button>
+              </div>}
+            </div>
+            <div style={{ padding:'16px', display:'flex', alignItems:'center', gap:14 }}>
+              {e.photo
+                ? <img src={e.photo} alt={e.name} style={{ width:68, height:68, borderRadius:'50%', objectFit:'cover', border:`3px solid ${C.goldBorder}`, flexShrink:0 }} />
+                : <div style={{ width:68, height:68, borderRadius:'50%', background:C.goldLight, border:`3px solid ${C.goldBorder}`, display:'flex', alignItems:'center', justifyContent:'center', fontSize:30, flexShrink:0 }}>🏆</div>
+              }
+              <div>
+                <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:19, fontWeight:700, color:C.blue }}>{e.name}</div>
+                <div style={{ fontSize:14, color:C.gold, fontWeight:600, marginTop:3 }}>{e.tenure}</div>
+                {e.year && <div style={{ fontSize:12, color:C.muted, fontWeight:500 }}>{e.year}</div>}
+              </div>
+            </div>
+          </Card>
+        ))}
+      </div>
+
+      <Sheet open={sheet} onClose={()=>setSheet(false)} title={editId?'EDIT ENTRY':'ADD PAST CHAIRMAN'}>
+        <Field label="Photo">
+          <div style={{ display:'flex', alignItems:'center', gap:14, marginBottom:4 }}>
+            {form.photo
+              ? <img src={form.photo} alt="preview" style={{ width:60, height:60, borderRadius:'50%', objectFit:'cover', border:`2px solid ${C.goldBorder}` }} />
+              : <div style={{ width:60, height:60, borderRadius:'50%', background:C.goldLight, border:`2px solid ${C.goldBorder}`, display:'flex', alignItems:'center', justifyContent:'center', fontSize:26 }}>🏆</div>
+            }
+            <label style={{ display:'inline-flex', alignItems:'center', gap:6, background:C.blueLight, border:`1.5px solid ${C.blue}`, borderRadius:8, padding:'8px 14px', cursor:'pointer', fontSize:13, fontWeight:700, color:C.blue }}>
+              📷 {form.photo?'Change Photo':'Upload Photo'}
+              <input type="file" accept="image/*" style={{ display:'none' }} onChange={e=>handlePhoto(e.target.files && e.target.files[0])} />
+            </label>
+          </div>
+          {uploading && <div style={{ fontSize:12, color:C.muted, fontWeight:600 }}>Uploading…</div>}
+          {upErr && <div style={{ fontSize:12, color:C.red, fontWeight:600 }}>{upErr}</div>}
+        </Field>
+        <Field label="Full Name"><Inp value={form.name} onChange={e=>u('name',e.target.value)} placeholder="e.g. Chief Emeka Obi" /></Field>
+        <Field label="Tenure"><Inp value={form.tenure} onChange={e=>u('tenure',e.target.value)} placeholder="e.g. 2012 – 2015" /></Field>
+        <Field label="Year (optional)"><Inp value={form.year} onChange={e=>u('year',e.target.value)} placeholder="e.g. 2012" /></Field>
+        <div style={{ display:'flex', gap:10, marginTop:6 }}>
+          <Btn onClick={()=>setSheet(false)} variant="muted" fullWidth>Cancel</Btn>
+          <Btn onClick={save} variant="primary" fullWidth>{editId?'Save Changes':'Add to Wall'}</Btn>
+        </div>
+      </Sheet>
+    </div>
+  );
+}
+
+// ── SETTINGS PAGE ─────────────────────────────────────────────────────────────
+function SettingsPage({ settings, setSettings, passwords, setPasswords, role }) {
+  const [pwSheet, setPwSheet] = useState(false);
+  const [pwRole, setPwRole] = useState('');
+  const [newPw, setNewPw] = useState('');
+  const [pwErr, setPwErr] = useState('');
+  const [flash, setFlash] = useState('');
+  const isChair = role==='chairman';
+  const u = (k,v) => setSettings(p=>({...p,[k]:v}));
+
+  const savePw = () => {
+    if (newPw.length<6) { setPwErr('Must be at least 6 characters.'); return; }
+    setPasswords(p=>({...p,[pwRole]:newPw}));
+    setPwSheet(false); setFlash('Password updated!');
+    setTimeout(()=>setFlash(''),2500);
+  };
+  const disconnect = () => {
+    if (window.confirm('Disconnect this device? You will need to re-enter your Supabase details to reconnect.')) {
+      try { localStorage.removeItem(SB_KEY); } catch(e) {}
+      window.location.reload();
+    }
+  };
+
+  return (
+    <div>
+      <PageHdr title="SETTINGS" />
+      <div style={{ padding:'16px 16px 100px' }}>
+        {flash && <Info text={`✓ ${flash}`} type="success" />}
+
+        <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:12, fontWeight:700, letterSpacing:1.5, color:C.muted, marginBottom:10 }}>FINANCIAL RATES</div>
+        {!isChair && <Info text="Only the Chairman can change financial rates." />}
+        {[['monthlyDues','Monthly Dues (₦)',500],['meetingLatenessFee','Meeting Lateness Fee (₦)',200],['yellowCardFee','Yellow Card Fee (₦)',200],['redCardFee','Red Card Fee (₦)',500]].map(([k,lb,def])=>(
+          <Card key={k} style={{ marginBottom:8, padding:'12px 14px', display:'flex', alignItems:'center', gap:12 }}>
+            <div style={{ flex:1, fontWeight:600, fontSize:13, color:C.text }}>{lb}</div>
+            <input type="number" value={(settings && settings[k] != null) ? settings[k] : def} onChange={e=>isChair&&u(k,Number(e.target.value))} disabled={!isChair}
+              style={{ width:90, padding:'7px 10px', fontSize:14, fontWeight:700, border:`1.5px solid ${C.border}`, borderRadius:8, textAlign:'right', fontFamily:"'Oswald',sans-serif", color:C.blue, background:isChair?C.white:C.bg }} />
+          </Card>
+        ))}
+
+        <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:12, fontWeight:700, letterSpacing:1.5, color:C.muted, marginTop:20, marginBottom:10 }}>ROLE PASSWORDS</div>
+        {!isChair && <Info text="Only the Chairman can change role passwords." />}
+        {ROLES_LIST.filter(r=>r.val!=='member').map(r=>(
+          <Card key={r.val} style={{ marginBottom:8, padding:'11px 14px', display:'flex', alignItems:'center', gap:12 }}>
+            <span style={{ fontSize:20 }}>{r.icon}</span>
+            <div style={{ flex:1 }}>
+              <div style={{ fontWeight:700, fontSize:13, color:C.text }}>{r.label}</div>
+              <div style={{ fontSize:12, color:C.muted, fontWeight:500 }}>{(passwords && passwords[r.val]) || DEFAULT_PWS[r.val]}</div>
+            </div>
+            {isChair && <Btn size="sm" variant="ghost" onClick={()=>{ setPwRole(r.val); setNewPw(''); setPwErr(''); setPwSheet(true); }}>Change</Btn>}
+          </Card>
+        ))}
+
+        <div style={{ fontFamily:"'Oswald',sans-serif", fontSize:12, fontWeight:700, letterSpacing:1.5, color:C.muted, marginTop:20, marginBottom:10 }}>LIVE SYNC</div>
+        <Card style={{ padding:'14px', marginBottom:8 }}>
+          <div style={{ fontSize:13, fontWeight:600, color:C.text, marginBottom:12 }}>
+            ✅ Connected to Supabase — all members share live real-time data.
+          </div>
+          <Btn size="sm" variant="muted" onClick={disconnect}>🔌 Re-pair / Disconnect This Device</Btn>
+        </Card>
+      </div>
+
+      <Sheet open={pwSheet} onClose={()=>setPwSheet(false)} title={`CHANGE PASSWORD — ${pwRole.replace(/_/g,' ').toUpperCase()}`}>
+        <div style={{ fontSize:13, color:C.muted, fontWeight:500, marginBottom:14 }}>
+          Current password: <strong style={{ color:C.text }}>{(passwords && passwords[pwRole]) || DEFAULT_PWS[pwRole]}</strong>
+        </div>
+        <Field label="New Password" error={pwErr}>
+          <Inp value={newPw} onChange={e=>{ setNewPw(e.target.value); setPwErr(''); }} placeholder="Minimum 6 characters" />
+        </Field>
+        <div style={{ display:'flex', gap:10, marginTop:6 }}>
+          <Btn onClick={()=>setPwSheet(false)} variant="muted" fullWidth>Cancel</Btn>
+          <Btn onClick={savePw} variant="primary" fullWidth>Save Password</Btn>
+        </div>
+      </Sheet>
+    </div>
+  );
+}
+
+// ── APP ───────────────────────────────────────────────────────────────────────
+function App() {
+  const [role, setRole] = useState(null);
+  const [page, setPage] = useState('home');
+  const [members,  setMembers]  = useState([]);
+  const [dues,     setDues]     = useState({});
+  const [finance,  setFinance]  = useState([]);
+  const [meetings, setMeetings] = useState([]);
+  const [emeritus, setEmeritus] = useState([]);
+  const [settings, setSettings] = useState({ monthlyDues:500, meetingLatenessFee:200, yellowCardFee:200, redCardFee:500 });
+  const [passwords,setPasswords]= useState(DEFAULT_PWS);
+  const [booted,   setBooted]   = useState(false);
+
+  // Subscribe to all Supabase collections
+  useEffect(() => {
+    const unsubs = [];
+    const bind = (key, setter) => unsubs.push(listenDoc(key, v => { if (v!==null) setter(v); }));
+    bind('members',   setMembers);
+    bind('dues',      setDues);
+    bind('finance',   setFinance);
+    bind('meetings',  setMeetings);
+    bind('emeritus',  setEmeritus);
+    bind('settings',  setSettings);
+    bind('passwords', setPasswords);
+    setTimeout(() => setBooted(true), 900);
+    return () => unsubs.forEach(u => u());
+  }, []);
+
+  // Sync back to Supabase on every change (skip initial empty states)
+  useEffect(() => { if (booted) writeDoc('members',   members);   }, [members]);
+  useEffect(() => { if (booted) writeDoc('dues',      dues);      }, [dues]);
+  useEffect(() => { if (booted) writeDoc('finance',   finance);   }, [finance]);
+  useEffect(() => { if (booted) writeDoc('meetings',  meetings);  }, [meetings]);
+  useEffect(() => { if (booted) writeDoc('emeritus',  emeritus);  }, [emeritus]);
+  useEffect(() => { if (booted) writeDoc('settings',  settings);  }, [settings]);
+  useEffect(() => { if (booted) writeDoc('passwords', passwords); }, [passwords]);
+
+  if (!role) return <LoginScreen onLogin={setRole} passwords={passwords} />;
+
+  const p = { members, setMembers, dues, setDues, finance, setFinance, meetings, setMeetings, emeritus, setEmeritus, settings, setSettings, passwords, setPasswords, role };
+
+  return (
+    <div style={{ maxWidth:520, margin:'0 auto', minHeight:'100vh', background:C.bg, position:'relative' }}>
+      <div style={{ paddingBottom:68 }}>
+        {page==='home'     && <HomePage    {...p} onNav={setPage} />}
+        {page==='members'  && <MembersPage  {...p} />}
+        {page==='dues'     && <DuesPage     {...p} />}
+        {page==='finance'  && <FinancePage  {...p} />}
+        {page==='meetings' && <MeetingsPage {...p} />}
+        {page==='emeritus' && <EmeritusPage {...p} />}
+        {page==='settings' && <SettingsPage {...p} />}
+      </div>
+      <NavBar page={page} onNav={setPage} />
+    </div>
+  );
+}
+
+// ── ROOT ──────────────────────────────────────────────────────────────────────
+function Root() {
+  const [connected, setConnected] = useState(sbReady);
+  if (!connected) return <ConnectScreen onConnected={() => setConnected(true)} />;
+  return <App />;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<Root />);
+</script>
+</body>
+</html>
